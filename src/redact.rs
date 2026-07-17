@@ -34,7 +34,10 @@ use regex::Regex;
 /// `identity|node|master|ed25519|bls|api` prose forms; positional Debug shapes with no separator
 /// (`PrivKey(…)`/`Seed([…])`/`Mnemonic("…")`) are caught by [`SECRET_DEBUG_TUPLE`]; and the `priv`
 /// substring rule is tightened to private-key markers so `privacy`/`private-beta` are not over-scrubbed.
-pub const RULES_VERSION: u32 = 5;
+/// v5 → v6 (#723): [`SECRET_DEBUG_TUPLE`] became SUFFIX-driven instead of a fixed whole-name list, so
+/// prefixed/aliased secret types (`ExtendedPrivKey(…)`, `MasterSecret(…)`, `BlsSk(…)`, `Ed25519Sk(…)`)
+/// are now caught; `Sk` is matched case-sensitively so `Task(…)`/`Disk(…)` stay unscathed.
+pub const RULES_VERSION: u32 = 6;
 
 /// The minimum consecutive BIP39 words that constitute a redactable mnemonic run (SPEC §8.2).
 const MIN_MNEMONIC_RUN: usize = 12;
@@ -168,13 +171,27 @@ fn value_looks_secret(value: &str) -> bool {
 }
 
 /// Positional / Debug-struct shapes that carry secret material with NO `:`/`=` separator — e.g.
-/// `PrivKey(0xabc…)`, `Seed([1, 2, 3])`, `Mnemonic("abandon …")` — matched by no kv rule. Keyed on
-/// KNOWN secret TYPE names (case-insensitive) so benign wrappers like `Coin(…)`/`Peer(…)` are left
-/// alone. Group 1 = the type name (kept), 2 = the opening bracket, 3 = the closing bracket; the
-/// enclosed material is replaced. `[^)\]]*` keeps the match within a single bracket pair.
+/// `PrivKey(0xabc…)`, `Seed([1, 2, 3])`, `Mnemonic("abandon …")`, `ExtendedPrivKey(…)`,
+/// `MasterSecret(…)`, `BlsSk(…)` — matched by no kv rule.
+///
+/// The detector is SUFFIX-driven, not a fixed list of whole type names (#723): it matches any
+/// CamelCase type identifier that ENDS in a secret marker immediately before the bracket, so a
+/// prefix like `Extended`/`Master`/`Node`/`Bls`/`Ed25519` is absorbed by the leading `[A-Za-z0-9]*`.
+/// A full-word marker (`privkey`/`privatekey`/`secretkey`/`signingkey`/`secretstring`/`secret`/
+/// `seed`/`mnemonic`/`keypair`/`xprv`/`xpriv`/`masterkey`) is matched CASE-INSENSITIVELY, while the
+/// short `Sk` abbreviation is matched CASE-SENSITIVELY (capital `S`, lowercase `k`) so genuine
+/// secret-key types (`BlsSk`, `Ed25519Sk`) are caught while common words ending in lowercase `sk`
+/// (`Task`, `Disk`, `Mask`, `Ask`) are NOT false-scrubbed. The marker must sit immediately before
+/// the bracket, so `Skip(…)`/`Secretariat(…)` do not match (intervening chars break the suffix), and
+/// benign wrappers like `Coin(…)`/`Peer(…)` have no marker at all. The list is explicitly
+/// NON-EXHAUSTIVE (SPEC §8.2) — source-discipline (SPEC §7) is the primary defense; this is
+/// defense-in-depth for the common secret-type Debug shapes.
+///
+/// Group 1 = the type name (kept), 2 = the opening bracket, 3 = the closing bracket; the enclosed
+/// material is replaced. `[^)\]]*` keeps the match within a single bracket pair.
 static SECRET_DEBUG_TUPLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)\b(priv(?:ate)?key|secretkey|signingkey|secretstring|seed|mnemonic|keypair|xprv|masterkey|ed25519secretkey|blssecretkey)\s*([(\[])[^)\]]*([)\]])",
+        r"\b([A-Za-z0-9]*(?:(?i:privatekey|privkey|secretkey|signingkey|secretstring|secret|seed|mnemonic|keypair|xprv|xpriv|masterkey)|Sk))\s*([(\[])[^)\]]*([)\]])",
     )
     .unwrap()
 });
@@ -705,6 +722,62 @@ mod tests {
             let got = line(&format!("{name}={secret}"));
             assert!(!got.contains(secret), "{name} leaked: {got}");
             assert!(got.contains("[REDACTED:key]"), "{name}: {got}");
+        }
+    }
+
+    // --- v6: SECRET_DEBUG_TUPLE was a NON-EXHAUSTIVE fixed list (#723). Each asserts the VALUE
+    // is ABSENT (not merely that a marker appeared), and benign look-alikes are KEPT. ---
+
+    /// REGRESSION (#723): positional secret Debug shapes the OLD fixed alternation MISSED — a
+    /// PREFIXED private-key type (`ExtendedPrivKey`), a `*Secret` type (`MasterSecret`), and the
+    /// short `*Sk` abbreviation (`BlsSk`) — must have their enclosed material redacted.
+    #[test]
+    fn redacts_prefixed_and_aliased_secret_debug_shapes() {
+        let cases = [
+            (
+                "ExtendedPrivKey(xprv9sdeadbeefcafe0011223344)",
+                "xprv9sdeadbeefcafe0011223344",
+            ),
+            (
+                "MasterSecret(deadbeefdeadbeefdeadbeef01)",
+                "deadbeefdeadbeefdeadbeef01",
+            ),
+            (
+                "BlsSk(5f3a9c1b7e2d4088aa11bb22)",
+                "5f3a9c1b7e2d4088aa11bb22",
+            ),
+            ("Ed25519Sk([222, 173, 190, 239])", "222, 173, 190"),
+            (
+                r#"NodeSecretKey("abandonabilityable")"#,
+                "abandonabilityable",
+            ),
+            ("KeyPair(0xcafebabecafebabecafe)", "cafebabecafebabecafe"),
+        ];
+        for (input, secret) in cases {
+            let got = line(input);
+            assert!(!got.contains(secret), "positional secret leaked: {got}");
+            assert!(got.contains("[REDACTED:key]"), "not redacted: {got}");
+        }
+    }
+
+    /// REGRESSION (#723 over-scrub guard): benign Debug shapes whose type names merely END in
+    /// lowercase `sk` (`Task`/`Disk`/`Mask`/`Ask`) or are unrelated (`Coin`/`Peer`) must be KEPT —
+    /// the `Sk` suffix is matched CASE-SENSITIVELY so common words are not false-scrubbed.
+    #[test]
+    fn keeps_benign_debug_shapes_ending_in_lowercase_sk() {
+        for benign in [
+            "Task([1, 2, 3])",
+            "Disk(203.0.113.7)",
+            "Mask(255)",
+            "Ask(bid, offer)",
+            "Coin([222, 173])",
+            "Peer(203.0.113.7)",
+        ] {
+            let got = line(benign);
+            assert!(
+                !got.contains("[REDACTED"),
+                "benign shape `{benign}` over-scrubbed: {got}"
+            );
         }
     }
 
