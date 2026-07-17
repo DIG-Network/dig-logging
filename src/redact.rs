@@ -28,7 +28,8 @@ use regex::Regex;
 ///
 /// v2 added field-name-driven private-key/seed redaction ([`SENSITIVE_KV`], [`KEY_PHRASE`]) and
 /// numbered-mnemonic detection, over v1's PEM + token/auth + narrow mnemonic set.
-pub const RULES_VERSION: u32 = 3;
+/// v3 → v4: fixed AUTH_HEADER to redact full standard-base64 credentials (including +/= chars).
+pub const RULES_VERSION: u32 = 4;
 
 /// The minimum consecutive BIP39 words that constitute a redactable mnemonic run (SPEC §8.2).
 const MIN_MNEMONIC_RUN: usize = 12;
@@ -55,10 +56,12 @@ static PEM_BLOCK: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)-----BEGIN[^-]*-----.*?-----END[^-]*-----").unwrap());
 
 /// `Authorization: <v>` / `"authorization":"<v>"` — keep the key, redact the value.
-/// Handles both `Authorization: Bearer <token>` and bare `Authorization: <opaque>` forms,
-/// consuming the Bearer scheme + token together so the full credential is redacted.
+/// Handles `Authorization: <scheme> <token>` (e.g. Bearer, Basic, etc) and bare `Authorization: <opaque>`
+/// forms, consuming the optional scheme + full credential value together so all base64 chars (+/=//) are
+/// included. The value class `[^"\s,}]+` stops at quote/space/comma/brace to correctly bound header values
+/// in both plain-text and JSON-embedded logs.
 static AUTH_HEADER: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?i)(authorization"?\s*[:=]\s*"?)((?:[Bb]earer\s+)?[A-Za-z0-9._\-]+)"#).unwrap()
+    Regex::new(r#"(?i)(authorization"?\s*[:=]\s*"?)((?:[A-Za-z]+\s+)?[^"\s,}]+)"#).unwrap()
 });
 
 /// `Bearer <token>` anywhere.
@@ -427,5 +430,60 @@ mod tests {
         assert!(got.contains("[REDACTED:token]"), "{got}");
         assert!(!got.contains("[REDACTED:token][REDACTED"), "{got}");
         assert!(!got.contains("sekret") && !got.contains("other"), "{got}");
+    }
+
+    /// REGRESSION TEST: Basic auth credentials (standard base64) must be fully redacted, including
+    /// the `+`, `/`, `=` chars that distinguish standard base64 from base64url. The prior regex
+    /// excluded these chars and leaked the tail of the base64 string.
+    #[test]
+    fn redacts_basic_auth_with_standard_base64() {
+        let basic_b64 = "dXNlcjpwYXNz+w=="; // standard base64 with `+` and `=`
+        let got = line(&format!("Authorization: Basic {basic_b64}"));
+        assert!(
+            got.contains("[REDACTED:auth]"),
+            "Basic auth not redacted: {got}"
+        );
+        assert!(
+            !got.contains(basic_b64),
+            "Basic auth credential leaked: {got}"
+        );
+        assert!(
+            !got.contains("+w=="),
+            "Basic auth tail (+/= chars) leaked: {got}"
+        );
+    }
+
+    /// REGRESSION TEST: Bearer tokens with standard base64 chars (`+`, `/`, `=`) must be fully
+    /// redacted. The prior regex excluded these chars, leaking the tail.
+    #[test]
+    fn redacts_bearer_with_standard_base64() {
+        let bearer_b64 = "abc+def/ghi=="; // standard base64 with `+`, `/`, `=`
+        let got = line(&format!("Authorization: Bearer {bearer_b64}"));
+        assert!(
+            got.contains("[REDACTED:auth]"),
+            "Bearer auth not redacted: {got}"
+        );
+        assert!(!got.contains(bearer_b64), "Bearer credential leaked: {got}");
+        assert!(
+            !got.contains("+def/ghi=="),
+            "Bearer tail (+/= chars) leaked: {got}"
+        );
+    }
+
+    /// REGRESSION TEST: Bare Authorization values (non-Bearer schemes) with standard base64 must be
+    /// fully redacted.
+    #[test]
+    fn redacts_bare_authorization_with_standard_base64() {
+        let bare_b64 = "dXNlcjpwYXNz+w==";
+        let got = line(&format!("Authorization: {bare_b64}"));
+        assert!(
+            got.contains("[REDACTED:auth]"),
+            "Bare auth not redacted: {got}"
+        );
+        assert!(
+            !got.contains(bare_b64),
+            "Bare auth credential leaked: {got}"
+        );
+        assert!(!got.contains("+w=="), "Bare auth tail leaked: {got}");
     }
 }
