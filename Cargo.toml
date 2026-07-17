@@ -1,6 +1,6 @@
 [package]
 name = "dig-logging"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.75"
 description = "Shared structured logging + log-collection building block for the DIG service binaries (dig-node, dig-dns, dig-updater): dual JSONL-file + human-stderr sinks, a per-OS log-dir convention, daily rotation + a byte-cap janitor, run_id/op_id correlation, a versioned redaction engine, and a reusable `logs` CLI verb set."

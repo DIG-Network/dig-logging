@@ -84,6 +84,19 @@ The CLI and the service resolve identically, so `<bin> logs path` names the same
 service writes to. A binary MUST `create_dir_all` the resolved dir on init (installer provisioning is
 an optimization, not a hard dependency).
 
+**3.1 Windows operator-read ACE.** On Windows the machine root lives under `%ProgramData%\DigNetwork`,
+which dig-installer locks to a protected, NON-inheriting DACL of `{SYSTEM:F, Administrators:F}`
+(`icacls /inheritance:r` — the shared-root contract). The `logs\<service>` subtree therefore inherits
+NO non-admin read from that root. To keep logs operator-readable (§3), when the **machine-root** branch
+is taken, dig-logging sets its OWN explicit ACE on the service dir — an ADD-only (`icacls /grant:r`,
+never DACL-replacing) read+execute grant to `BUILTIN\Users` by SID `S-1-5-32-545`, inheritable
+(`(OI)(CI)RX`) so log files inherit read. This follows the shared-root adopter rule (a child needing
+non-admin read sets its own ACE) and MUST NOT loosen the root DACL. The grant is best-effort — a
+failure never blocks logging. It is applied ONLY to the machine-root branch; the `DIG_LOG_DIR`
+override and the per-user dev fallback are caller-owned and left untouched. On macOS/Linux the
+machine root's default directory mode already governs operator read (world-readable log dirs); no
+extra step is needed.
+
 ## 4. Rotation & retention (D4)
 
 - Files roll **daily**, named **`<service>.jsonl.YYYY-MM-DD`** (UTC date), via
