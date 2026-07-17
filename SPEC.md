@@ -93,11 +93,13 @@ an optimization, not a hard dependency).
   runaway-error day the count cap would not. Default `DIG_LOG_MAX_BYTES` = **50 MiB** (52 428 800).
   On init and hourly thereafter, files in the service dir are summed; while the total exceeds the
   cap, the **oldest** file (by modified time) is deleted. The current day's file is never deleted.
-- **4.4 Non-blocking, lossy writer.** The file writer is `tracing_appender::non_blocking` in **lossy**
-  mode: under backpressure lines are DROPPED rather than blocking the caller — a saturated logging
-  pipeline MUST NEVER stall a service's serve path. When drops occur the writer surfaces them (the
-  non-blocking worker's dropped-line accounting); dig-logging emits a `WARN` event
-  `target = "dig_logging"` reporting the dropped count so loss is itself visible in the log.
+- **4.4 Non-blocking, lossy writer.** The file writer is a custom `LossyWriter`: each rendered line is
+  handed to a bounded `sync_channel` (capacity 8192) drained by a dedicated writer thread that owns the
+  rolling file appender. Under backpressure — a full channel — the line is DROPPED and an `AtomicU64`
+  drop counter is bumped rather than blocking the caller, so a saturated logging pipeline MUST NEVER
+  stall a service's serve path. The counter (`LossyWriter::dropped`) surfaces the loss; dig-logging
+  emits a `WARN` event `target = "dig_logging"` reporting the dropped count so loss is itself visible
+  in the log.
 
 ## 5. Levels (D5)
 
@@ -158,15 +160,29 @@ dig-logging ships a reusable clap subcommand a binary mounts verbatim as `<bin> 
 
 ### 8.2 Redaction engine — `dig_logging::redact` (versioned rule set)
 
-Redaction is applied to every line at BUNDLE (and, later, report) time — never a substitute for §7.
-The rule set is versioned (`REDACTION_RULES_VERSION`, recorded in the bundle manifest). Rules
+Redaction is applied to every line at BUNDLE time (and, later, report time) — the bundle writer
+re-redacts the raw on-disk JSONL as it zips it. It is NEVER applied at write time: the on-disk log
+files hold RAW lines, so `logs tail` and any manual copy of a log file see un-redacted text. Bundle
+redaction is thus the guaranteed chokepoint for anything sent off-box; it is the SECOND line of
+defense, never a substitute for §7 (the never-log-at-source rule remains the primary guarantee).
+The rule set is versioned (`redaction_rules_version`, recorded in the bundle manifest). Rules
 (applied to each line's raw text so both `message` and any structured field are covered):
 
 - **REDACT** (replace the value with `[REDACTED:<kind>]`):
-  - **BIP39 mnemonic runs** — a run of **≥ 12 consecutive** English-BIP39-wordlist words (whitespace-
-    separated, case-insensitive), whether in `key=value`, a bare comment line, or split across the
-    text. This MUST catch comment-style and multi-line placements, not only `key=value` (the
-    `.test-credentials` leak: seeds live as `# Mnemonic:` comment lines).
+  - **BIP39 mnemonic runs** — a run of **≥ 12 consecutive** English-BIP39-wordlist words (case-
+    insensitive), whether in `key=value`, a bare comment line, a NUMBERED `1. abandon 2. ability …`
+    layout, or split across the text. This MUST catch comment-style, numbered, and multi-line
+    placements, not only `key=value` (the `.test-credentials` leak: seeds live as `# Mnemonic:`
+    comment lines). Non-English BIP39 wordlists are an ACCEPTED RESIDUAL — the detector uses the
+    English wordlist only (bundling all wordlists is out of scope); source-discipline (§7) covers
+    non-English seeds.
+  - **Private-key / seed FIELDS (field-name-driven)** — a field whose NAME marks it secret has its
+    value redacted, in `key=value`, `key: value`, or JSON `"key":"value"` form, covering raw
+    base64/hex values (the DIG identity signing key, the beacon Ed25519 key): `private_key`,
+    `secret_key`, `signing_key`, `beacon_key`, `sk`, `xprv`, `wif`, `seed`, `mnemonic`, and generally
+    any name ending `_key`/`_secret` or containing `seed`/`mnemonic`/`priv`. Also the bare prose form
+    `<signing|private|secret|beacon> key <hex-or-base64>`. Redaction is FIELD-NAME-driven, NOT a
+    blanket entropy heuristic — see KEEP below.
   - **PEM blocks** — `-----BEGIN … -----` … `-----END … -----`, including blocks split across lines.
   - **`Authorization` / bearer values** — `Authorization: <v>`, `Bearer <v>`.
   - **Control / pairing / API / session token values** — `token`/`api_key`/`apikey`/`secret`/
@@ -174,8 +190,14 @@ The rule set is versioned (`REDACTION_RULES_VERSION`, recorded in the bundle man
 - **TRUNCATE**:
   - bech32 `xch1…` / `txch1…` addresses → keep the HRP + first 8 payload chars, then `…`.
   - home-dir usernames in paths: `C:\Users\<u>`, `/home/<u>`, `/Users/<u>` → `…\<user>` / `…/<user>`.
-- **KEEP** (never redacted — public + load-bearing for debugging): store ids, root hashes, coin ids,
-  peer IPs, ports.
+- **KEEP** (never redacted — public + load-bearing for debugging, even though they are ALSO 32-byte
+  hex/base64): store ids, root hashes, coin ids, puzzle hashes, peer IPs, ports, and the safe field
+  names `store_id`/`root`/`root_hash`/`coin_id`/`puzzle_hash`/`owner_puzzle_hash`/`peer`/`addr`/`ip`/
+  `generation`/`capsule`/`resource_key`/`public_key`. Key redaction is therefore field-NAME-driven
+  and MUST NOT blanket-scrub high-entropy hex/base64; the safe field names override the `_key`/
+  `_secret` suffix rule (e.g. `resource_key` is kept). When in doubt a value is KEPT unless its field
+  name is explicitly sensitive — a false-scrub of a storeId breaks debugging, so keys are named
+  explicitly rather than guessed by entropy.
 
 ### 8.3 Bundle format
 

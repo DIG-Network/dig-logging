@@ -10,7 +10,7 @@ use std::path::Path;
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use time::{Date, Duration, OffsetDateTime};
 
 use crate::error::Result;
 use crate::{bundle, dirs, filter, Service};
@@ -59,7 +59,12 @@ pub fn command() -> Command {
                         .long("out")
                         .default_value("dig-logs.zip"),
                 )
-                .arg(Arg::new("all").long("all").action(ArgAction::SetTrue)),
+                .arg(Arg::new("all").long("all").action(ArgAction::SetTrue))
+                .arg(
+                    Arg::new("since")
+                        .long("since")
+                        .help("Limit to files no older than a duration, e.g. 24h or 7d"),
+                ),
         )
 }
 
@@ -136,16 +141,18 @@ fn run_bundle(service: &Service, dir: &Path, m: &ArgMatches) -> Result<()> {
         .map(String::as_str)
         .unwrap_or("dig-logs.zip");
     let all = m.get_flag("all");
-    let created_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_default();
+    let now = OffsetDateTime::now_utc();
+    let created_at = now.format(&Rfc3339).unwrap_or_default();
+    let since = m
+        .get_one::<String>("since")
+        .and_then(|s| since_cutoff(s, now.date()));
 
     let sources = if all {
         // `--all`: every service under the shared root (SPEC §8.1) — nested `<service>/<file>`.
         let root = dir.parent().unwrap_or(dir).to_path_buf();
-        collect_all_services(&root)
+        collect_all_services(&root, since)
     } else {
-        bundle::read_service_dir(dir, service.name)
+        bundle::read_service_dir(dir, service.name, since)
     };
     let service_label = if all { "all" } else { service.name };
     let bytes = bundle::build(service_label, service.version, &created_at, &sources)?;
@@ -155,8 +162,9 @@ fn run_bundle(service: &Service, dir: &Path, m: &ArgMatches) -> Result<()> {
 }
 
 /// Read every `<service>/` subdir under the shared log `root`, prefixing archive names with the
-/// service so an `--all` bundle keeps services separated.
-fn collect_all_services(root: &Path) -> Vec<bundle::SourceFile> {
+/// service so an `--all` bundle keeps services separated. `since` narrows each service's files to the
+/// `--since` window (SPEC §8.1).
+fn collect_all_services(root: &Path, since: Option<Date>) -> Vec<bundle::SourceFile> {
     let mut sources = Vec::new();
     let dirents = std::fs::read_dir(root).into_iter().flatten().flatten();
     for dirent in dirents {
@@ -164,12 +172,28 @@ fn collect_all_services(root: &Path) -> Vec<bundle::SourceFile> {
             continue;
         }
         let service = dirent.file_name().to_string_lossy().into_owned();
-        for mut file in bundle::read_service_dir(&dirent.path(), &service) {
+        for mut file in bundle::read_service_dir(&dirent.path(), &service, since) {
             file.name = format!("{service}/{}", file.name);
             sources.push(file);
         }
     }
     sources
+}
+
+/// Resolve a `--since` duration (`24h`, `7d`) to the OLDEST rotation date to include, relative to
+/// `today`. Sub-day units round UP to whole days (files rotate daily, §4.3). An unparseable value
+/// yields `None` (no filtering) so a typo never silently drops logs from a bug report.
+fn since_cutoff(spec: &str, today: Date) -> Option<Date> {
+    let spec = spec.trim();
+    let split = spec.find(|c: char| !c.is_ascii_digit())?;
+    let (num, unit) = spec.split_at(split);
+    let n: i64 = num.parse().ok()?;
+    let days = match unit {
+        "d" => n,
+        "h" => (n + 23) / 24,
+        _ => return None,
+    };
+    Some(today.saturating_sub(Duration::days(days)))
 }
 
 /// The newest rotated log file for `service` in `dir`, by name (dates sort lexically), if any.
@@ -330,5 +354,27 @@ mod tests {
         let names: Vec<_> = cmd.get_subcommands().map(|c| c.get_name()).collect();
         assert!(names.contains(&"path") && names.contains(&"tail"));
         assert!(names.contains(&"level") && names.contains(&"bundle"));
+    }
+
+    #[test]
+    fn since_cutoff_parses_days_and_hours() {
+        use time::Month;
+        let today = Date::from_calendar_date(2026, Month::July, 16).unwrap();
+        assert_eq!(
+            since_cutoff("7d", today),
+            Date::from_calendar_date(2026, Month::July, 9).ok()
+        );
+        // 24h → 1 day; 25h rounds up to 2 days.
+        assert_eq!(
+            since_cutoff("24h", today),
+            Date::from_calendar_date(2026, Month::July, 15).ok()
+        );
+        assert_eq!(
+            since_cutoff("25h", today),
+            Date::from_calendar_date(2026, Month::July, 14).ok()
+        );
+        // Garbage → no filtering, never silently drops logs.
+        assert_eq!(since_cutoff("nonsense", today), None);
+        assert_eq!(since_cutoff("7w", today), None);
     }
 }
