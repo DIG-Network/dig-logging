@@ -156,11 +156,11 @@ static KEY_PHRASE: Lazy<Regex> = Lazy::new(|| {
 const CONDITIONAL_SENSITIVE: &[&str] = &["key", "keystore"];
 
 /// A VALUE that looks like raw secret key material: a long hex string or a base64/base64url blob
-/// (≥ 20 chars, standard-base64 alphabet incl. `+`/`/` and optional `=` padding). Hex is a subset of
-/// this alphabet, so this single shape covers 32-hex-char keys and base64-encoded keys alike. Used to
-/// gate [`CONDITIONAL_SENSITIVE`] names; mnemonic runs are already redacted upstream.
+/// (≥ 20 chars, standard-base64 + base64url alphabets incl. `+`/`/`/`-`/`_` and optional `=` padding).
+/// Hex is a subset of this alphabet, so this single shape covers 32-hex-char keys and base64-encoded
+/// keys alike. Used to gate [`CONDITIONAL_SENSITIVE`] names; mnemonic runs are already redacted upstream.
 static VALUE_SECRET_SHAPE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[A-Za-z0-9+/]{20,}={0,2}$").unwrap());
+    Lazy::new(|| Regex::new(r"^[A-Za-z0-9+/_-]{20,}={0,2}$").unwrap());
 
 fn value_looks_secret(value: &str) -> bool {
     VALUE_SECRET_SHAPE.is_match(value)
@@ -597,6 +597,25 @@ mod tests {
                 "benign `{benign}` over-scrubbed: {got}"
             );
         }
+    }
+
+    /// REGRESSION TEST (issue #714): a bare `key` with a base64url-encoded secret (containing `-`
+    /// and `_`) must be redacted. The prior VALUE_SECRET_SHAPE regex only matched standard base64
+    /// (+/), leaking base64url secrets with `-` or `_` characters.
+    #[test]
+    fn gap1_redacts_bare_key_with_base64url_value() {
+        // A 44-char base64url-encoded secret with - and _ (which wouldn't match the old regex)
+        let secret = "ZcjI14QiJ1Qety2clr-oDEkJyehiSBRoiYylEfi_JI";
+        let kv = line(&format!("key={secret}"));
+        assert!(!kv.contains(secret), "kv base64url secret leaked: {kv}");
+        assert!(kv.contains("[REDACTED:key]"), "kv not redacted: {kv}");
+
+        let json = line(&format!(r#"{{"key":"{secret}"}}"#));
+        assert!(
+            !json.contains(secret),
+            "json base64url secret leaked: {json}"
+        );
+        assert!(json.contains("[REDACTED:key]"), "json not redacted: {json}");
     }
 
     /// GAP 2: prose `<kind> key <hex>` for the extended kinds (`identity`/`node`/`master`/`ed25519`/
