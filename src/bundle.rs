@@ -160,7 +160,7 @@ mod tests {
             .unwrap()
             .read_to_string(&mut manifest)
             .unwrap();
-        assert!(manifest.contains("\"redaction_rules_version\": 6"));
+        assert!(manifest.contains("\"redaction_rules_version\": 7"));
         // Log file present, secret gone, public id kept.
         let mut log = String::new();
         archive

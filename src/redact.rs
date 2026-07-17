@@ -37,7 +37,10 @@ use regex::Regex;
 /// v5 → v6 (#723): [`SECRET_DEBUG_TUPLE`] became SUFFIX-driven instead of a fixed whole-name list, so
 /// prefixed/aliased secret types (`ExtendedPrivKey(…)`, `MasterSecret(…)`, `BlsSk(…)`, `Ed25519Sk(…)`)
 /// are now caught; `Sk` is matched case-sensitively so `Task(…)`/`Disk(…)` stay unscathed.
-pub const RULES_VERSION: u32 = 6;
+/// v6 → v7 (#730): [`SECRET_DEBUG_BRACE`] extends the same suffix-driven type-marker set to the
+/// named-field BRACE Debug shape (`SigningKey { scalar: <hex> }`), which evaded both the bracket-only
+/// tuple detector and the field-name kv rule when the field name was non-sensitive.
+pub const RULES_VERSION: u32 = 7;
 
 /// The minimum consecutive BIP39 words that constitute a redactable mnemonic run (SPEC §8.2).
 const MIN_MNEMONIC_RUN: usize = 12;
@@ -196,6 +199,26 @@ static SECRET_DEBUG_TUPLE: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+/// The BRACE-form counterpart of [`SECRET_DEBUG_TUPLE`] (#730): a `{:?}`-printed secret STRUCT whose
+/// FIELD name is itself non-sensitive — `SigningKey { scalar: <hex> }`, `SecretKey { inner: … }`,
+/// `MasterSecret { bytes: [ … ] }`. Such a line evades BOTH the bracket-only tuple detector AND the
+/// field-name-driven [`SENSITIVE_KV`] rule (the `scalar`/`inner`/`bytes` field name is not marked),
+/// so the raw material shipped unredacted. It reuses the EXACT SAME suffix-driven type-marker set as
+/// the tuple detector (so a leading qualifier like `Master`/`Extended`/`Bls`/`Ed25519` is absorbed
+/// and `Sk` is matched case-sensitively) — only the delimiter differs (`{ … }` instead of `( … )` /
+/// `[ … ]`). The whole brace body is redacted. `[^{}]*` keeps the match inside a single brace pair,
+/// so a nested inner secret struct is matched on its own scan. The type list is NON-EXHAUSTIVE by
+/// design (SPEC §8.2): a marker-LESS secret type (e.g. a bare `Signer { … }`) still relies on
+/// source-discipline (SPEC §7) — this is defense-in-depth, not the primary defense.
+///
+/// Group 1 = the type name (kept); the enclosed brace body is replaced.
+static SECRET_DEBUG_BRACE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"\b([A-Za-z0-9]*(?:(?i:privatekey|privkey|secretkey|signingkey|secretstring|secret|seed|mnemonic|keypair|xprv|xpriv|masterkey)|Sk))\s*\{[^{}]*\}",
+    )
+    .unwrap()
+});
+
 /// Is a field NAME one whose value must be redacted? Safe public ids ([`SAFE_KEY_NAMES`]) win first;
 /// then exact sensitive names, the `_key`/`_secret` suffix, `seed`/`mnemonic` substrings, and the
 /// private-key markers ([`marks_private_key`]). Deliberately does NOT contain a bare `priv` substring
@@ -253,6 +276,10 @@ pub fn line(input: &str) -> String {
     // Positional Debug shapes (`PrivKey(…)`/`Seed([…])`) carrying secret material with no separator.
     let stage = SECRET_DEBUG_TUPLE
         .replace_all(&stage, "${1}${2}[REDACTED:key]${3}")
+        .into_owned();
+    // The brace-form Debug shape (`SigningKey { scalar: … }`) whose field name is non-sensitive.
+    let stage = SECRET_DEBUG_BRACE
+        .replace_all(&stage, "${1} { [REDACTED:key] }")
         .into_owned();
     // Field-name-driven key redaction: redact a value when its NAME is secret, OR when a GENERIC
     // name (`key`/`keystore`) has a secret-SHAPED value; never re-touch an already-redacted value (so
@@ -777,6 +804,67 @@ mod tests {
             assert!(
                 !got.contains("[REDACTED"),
                 "benign shape `{benign}` over-scrubbed: {got}"
+            );
+        }
+    }
+
+    // --- v7: the positional detector missed the named-field BRACE Debug shape (#730). A secret-
+    // marker STRUCT type with a NON-sensitive field name (`SigningKey { scalar: <hex> }`) evaded
+    // both SECRET_DEBUG_TUPLE (brackets only) and SENSITIVE_KV (field name not marked). Each asserts
+    // the enclosed VALUE is ABSENT; benign brace structs stay readable. ---
+
+    /// REGRESSION (#730): a secret-marker CamelCase struct printed in `{:?}` brace form, whose FIELD
+    /// name is NOT itself sensitive (`scalar`, `inner`, `bytes`), leaked the raw material — neither
+    /// the bracket-only tuple detector nor the field-name kv rule caught it. The brace body is now
+    /// redacted wholesale. Asserts the VALUE is ABSENT (a marker-only assert is insufficient, §2.2).
+    #[test]
+    fn redacts_named_field_brace_secret_debug_shapes() {
+        let secret64 = "5f3a9c1b7e2d4088aa11bb22cc33dd445f3a9c1b7e2d4088aa11bb22cc33dd44";
+        let cases = [
+            // A marker-suffixed type with a NON-sensitive field name — the exact #730 leak shape.
+            (
+                format!("SigningKey {{ scalar: {secret64} }}"),
+                secret64.to_string(),
+            ),
+            (
+                "SecretKey { inner: deadbeefdeadbeefdeadbeef }".to_string(),
+                "deadbeefdeadbeefdeadbeef".to_string(),
+            ),
+            (
+                "MasterSecret { bytes: [222, 173, 190, 239] }".to_string(),
+                "222, 173, 190".to_string(),
+            ),
+            (
+                "KeyPair { a: 0xcafebabecafe, b: 0xdeadbeef }".to_string(),
+                "cafebabecafe".to_string(),
+            ),
+            (
+                "Ed25519Sk { d: 5f3a9c1b7e2d4088 }".to_string(),
+                "5f3a9c1b7e2d4088".to_string(),
+            ),
+        ];
+        for (input, secret) in cases {
+            let got = line(&input);
+            assert!(!got.contains(&secret), "brace secret leaked: {got}");
+            assert!(got.contains("[REDACTED:key]"), "not redacted: {got}");
+        }
+    }
+
+    /// REGRESSION (#730 over-scrub guard): benign brace structs whose TYPE carries no secret marker
+    /// (`PublicKey`, `VerifyingKey`, `Coin`, `Peer`) — even with a `Key`-suffixed type or a
+    /// high-entropy field value — stay fully readable; the brace detector is TYPE-marker-driven.
+    #[test]
+    fn keeps_benign_brace_debug_shapes() {
+        for benign in [
+            "PublicKey { bytes: cafebabecafebabecafebabecafebabe }",
+            "VerifyingKey { point: abc123def456abc123def456 }",
+            "Coin { amount: 1000000000, puzzle_hash: ec7c30deadbeef }",
+            "Peer { addr: 203.0.113.7, port: 9257 }",
+        ] {
+            let got = line(benign);
+            assert!(
+                !got.contains("[REDACTED"),
+                "benign brace `{benign}` over-scrubbed: {got}"
             );
         }
     }

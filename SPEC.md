@@ -218,9 +218,13 @@ The rule set is versioned (`redaction_rules_version`, recorded in the bundle man
     a CamelCase type name that ENDS in a secret marker (`*PrivKey`/`*SecretKey`/`*Secret`/`*Seed`/
     `*Sk`/…), so a leading qualifier is absorbed. The `Sk` abbreviation is matched CASE-SENSITIVELY so
     benign words ending in lowercase `sk` (`Task(…)`, `Disk(…)`) and unrelated wrappers (`Coin(…)`,
-    `Peer(…)`) are left alone. **This TYPE list is explicitly NON-EXHAUSTIVE**: a novel secret type
-    name can still slip through, so source-discipline (§7 — never log a secret in the first place)
-    remains the PRIMARY defense; this rule is defense-in-depth for the common Debug shapes.
+    `Peer(…)`) are left alone. The SAME type-marker set also matches the named-field BRACE Debug form
+    — `SigningKey { scalar: <hex> }`, `SecretKey { inner: … }`, `MasterSecret { bytes: [ … ] }` —
+    where the FIELD name is itself non-sensitive (so the field-name kv rule below would miss it); the
+    whole brace body is redacted. **This TYPE list is explicitly NON-EXHAUSTIVE**: a novel or
+    marker-LESS secret type name (e.g. a bare `Signer { … }`) can still slip through, so
+    source-discipline (§7 — never log a secret in the first place) remains the PRIMARY defense; this
+    rule is defense-in-depth for the common Debug shapes.
   - **PEM blocks** — `-----BEGIN … -----` … `-----END … -----`, including blocks split across lines.
   - **`Authorization` / bearer values** — `Authorization: <v>`, `Bearer <v>`.
   - **Control / pairing / API / session token values** — `token`/`api_key`/`apikey`/`secret`/
