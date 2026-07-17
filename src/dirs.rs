@@ -12,11 +12,46 @@
 //! The CLI and the service resolve identically, so `<bin> logs path` names the directory the service
 //! writes to. Resolution is a PURE function of an injected env-getter + a "can this dir be created?"
 //! probe, so every branch is table-testable without touching the real filesystem or environment.
+//!
+//! **Operator read on Windows (#728).** The machine root lives under `%ProgramData%\DigNetwork`,
+//! which dig-installer #715 locks to a protected, non-inheriting DACL of `{SYSTEM:F, Administrators:F}`
+//! (`icacls /inheritance:r`). The `logs\<service>` subtree therefore inherits NO non-admin read from
+//! that root. To keep logs operator-readable (SPEC §3), dig-logging follows the #715 adopter rule — a
+//! child needing non-admin read sets its OWN explicit ACE — and grants `BUILTIN\Users` a read+execute
+//! ACE on the machine service dir. This never loosens the #715 root DACL (a sibling subtree gets its
+//! own ACE; the root is untouched). Applied ONLY to the machine-root branch: the `DIG_LOG_DIR` override
+//! and the per-user dev fallback are caller-chosen / already user-owned and are left alone.
 
 use std::path::PathBuf;
 
 /// The env var that overrides the log ROOT outright (tests, custom deploys).
 pub const ENV_LOG_DIR: &str = "DIG_LOG_DIR";
+
+/// The `BUILTIN\Users` group SID — locale-independent, granted operator read on the machine log dir
+/// (#728). A well-known SID (not a localized name) so the `icacls` grant works on any Windows locale.
+const SID_USERS: &str = "S-1-5-32-545";
+
+/// Which resolution branch produced a log directory (SPEC §3). Distinguishes the machine root — the
+/// only branch under the #715-locked `%ProgramData%\DigNetwork` tree, and thus the only one needing an
+/// explicit operator-read ACE — from the caller-owned override and dev-fallback branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogDirSource {
+    /// The `DIG_LOG_DIR` override (a caller-chosen root).
+    Override,
+    /// The per-OS machine root (privileged run) — under the #715-locked root on Windows.
+    MachineRoot,
+    /// The per-user dev fallback (unprivileged run) — already owned by the running user.
+    DevFallback,
+}
+
+/// A resolved log directory plus the branch that produced it (see [`LogDirSource`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedLogDir {
+    /// The service log directory (`<root>/<service>`).
+    pub path: PathBuf,
+    /// The resolution branch that chose `path`.
+    pub source: LogDirSource,
+}
 
 /// Resolve the log directory for `service` from an injected env-getter and a dir-creatable probe.
 ///
@@ -24,6 +59,18 @@ pub const ENV_LOG_DIR: &str = "DIG_LOG_DIR";
 /// created and written?" — the caller wires it to the real filesystem in [`log_dir`], and tests
 /// inject a closure to exercise the machine-root vs dev-fallback branch deterministically.
 pub fn resolve_log_dir<G, C>(service: &str, get: G, can_create: C) -> PathBuf
+where
+    G: Fn(&str) -> Option<String>,
+    C: Fn(&std::path::Path) -> bool,
+{
+    resolve_log_dir_detailed(service, get, can_create).path
+}
+
+/// Resolve the log directory AND the branch that produced it (see [`resolve_log_dir`] for precedence).
+///
+/// Callers that must know whether the machine root was chosen — the only branch under the
+/// #715-locked Windows root — use this to decide whether to apply the operator-read ACE (#728).
+pub fn resolve_log_dir_detailed<G, C>(service: &str, get: G, can_create: C) -> ResolvedLogDir
 where
     G: Fn(&str) -> Option<String>,
     C: Fn(&std::path::Path) -> bool,
@@ -36,25 +83,70 @@ where
 
     // 1. Explicit override wins unconditionally.
     if let Some(root) = read(ENV_LOG_DIR) {
-        return PathBuf::from(root).join(service);
+        return ResolvedLogDir {
+            path: PathBuf::from(root).join(service),
+            source: LogDirSource::Override,
+        };
     }
 
     // 2. Machine root when its service dir is creatable; 3. else the per-user dev fallback.
     let machine = machine_root(&read).join(service);
     if can_create(&machine) {
-        return machine;
+        return ResolvedLogDir {
+            path: machine,
+            source: LogDirSource::MachineRoot,
+        };
     }
-    dev_root(&read).join(service)
+    ResolvedLogDir {
+        path: dev_root(&read).join(service),
+        source: LogDirSource::DevFallback,
+    }
 }
 
 /// The resolved service log directory for this process, wiring the real environment + a filesystem
-/// creatable-probe into [`resolve_log_dir`].
+/// creatable-probe into [`resolve_log_dir_detailed`]. When the machine-root branch is taken on Windows,
+/// grants operators (`BUILTIN\Users`) read on the freshly-created dir (#728) — see the module docs.
 pub fn log_dir(service: &str) -> PathBuf {
-    resolve_log_dir(
+    let resolved = resolve_log_dir_detailed(
         service,
         |key| std::env::var(key).ok(),
         |path| std::fs::create_dir_all(path).is_ok(),
-    )
+    );
+
+    #[cfg(windows)]
+    if resolved.source == LogDirSource::MachineRoot {
+        // Best-effort: a failed grant must never stop the service from logging. The dir already
+        // exists (the creatable-probe made it); we only relax read for operators.
+        grant_operator_read(&resolved.path);
+    }
+
+    resolved.path
+}
+
+/// The `icacls` argv that grants `BUILTIN\Users` a read+execute ACE, inheritable to child files/dirs,
+/// on `dir` (#728). By SID so it is locale-independent; `/grant:r` ADDS the ACE without replacing the
+/// DACL, so the inherited `{SYSTEM,Admins}` full-control from #715 (if any survives) stays intact.
+/// Pure, so the exact grant is unit-tested without touching the filesystem.
+pub fn windows_operator_read_args(dir: &str) -> Vec<String> {
+    vec![
+        dir.to_string(),
+        "/grant:r".to_string(),
+        format!("*{SID_USERS}:(OI)(CI)RX"),
+        "/T".to_string(),
+        "/C".to_string(),
+        "/Q".to_string(),
+    ]
+}
+
+/// Grant operators (`BUILTIN\Users`) read on the machine log dir via `icacls` (#728). Best-effort:
+/// any failure is swallowed, because losing operator read is a diagnostic inconvenience, never a
+/// reason to stop the service logging.
+#[cfg(windows)]
+fn grant_operator_read(dir: &std::path::Path) {
+    let Some(dir) = dir.to_str() else { return };
+    let _ = std::process::Command::new("icacls")
+        .args(windows_operator_read_args(dir))
+        .output();
 }
 
 /// The machine-wide log root (SPEC §3): `%PROGRAMDATA%\DigNetwork\logs` on Windows,
@@ -168,5 +260,39 @@ mod tests {
     fn linux_dev_fallback_without_xdg_uses_local_state() {
         let dir = resolve_log_dir("dig-dns", env(&[("HOME", "/home/dev")]), |_| false);
         assert_eq!(dir, Path::new("/home/dev/.local/state/dig/logs/dig-dns"));
+    }
+
+    #[test]
+    fn override_reports_override_source() {
+        let resolved =
+            resolve_log_dir_detailed("dig-node", env(&[(ENV_LOG_DIR, "/custom")]), |_| true);
+        assert_eq!(resolved.source, LogDirSource::Override);
+    }
+
+    #[test]
+    fn creatable_machine_root_reports_machine_source() {
+        // The machine root is the ONLY branch under the #715-locked Windows root, so it is the only
+        // one that later earns the operator-read ACE (#728).
+        let resolved = resolve_log_dir_detailed("dig-node", env(&[]), |_| true);
+        assert_eq!(resolved.source, LogDirSource::MachineRoot);
+    }
+
+    #[test]
+    fn uncreatable_machine_root_reports_dev_fallback_source() {
+        let resolved =
+            resolve_log_dir_detailed("dig-node", env(&[("HOME", "/home/dev")]), |_| false);
+        assert_eq!(resolved.source, LogDirSource::DevFallback);
+    }
+
+    #[test]
+    fn operator_read_grant_targets_users_sid_read_execute_inheritable() {
+        // #728: a non-replacing (`/grant:r`) read+execute ACE for BUILTIN\Users by SID, inheritable
+        // to child files/dirs — so operators can read logs without loosening the #715 root DACL.
+        let args = windows_operator_read_args(r"C:\ProgramData\DigNetwork\logs\dig-node");
+        assert_eq!(args[0], r"C:\ProgramData\DigNetwork\logs\dig-node");
+        assert!(args.iter().any(|a| a == "/grant:r"));
+        assert!(args.iter().any(|a| a == "*S-1-5-32-545:(OI)(CI)RX"));
+        // Never a DACL-replacing flag — the inherited {SYSTEM,Admins} full-control must survive.
+        assert!(!args.iter().any(|a| a == "/inheritance:r" || a == "/reset"));
     }
 }

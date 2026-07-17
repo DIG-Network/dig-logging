@@ -53,7 +53,10 @@ pub use init::{init, LogGuard};
 
 // The pure building blocks worth exposing for consumers + conformance tests (SPEC §9).
 pub use correlation::{new_run_id, parent_op_id, ENV_DIG_OP_ID, OP_ID_FIELD};
-pub use dirs::{log_dir, resolve_log_dir, ENV_LOG_DIR};
+pub use dirs::{
+    log_dir, resolve_log_dir, resolve_log_dir_detailed, windows_operator_read_args, LogDirSource,
+    ResolvedLogDir, ENV_LOG_DIR,
+};
 pub use filter::{resolve_filter, DEFAULT_DIRECTIVE, ENV_DIG_LOG, ENV_RUST_LOG};
 pub use janitor::{ENV_MAX_BYTES, ENV_RETENTION_DAYS};
 
