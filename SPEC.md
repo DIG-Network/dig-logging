@@ -105,9 +105,16 @@ an optimization, not a hard dependency).
 
 - **Default directive:** `info,hyper=warn,rustls=warn,h2=warn,tower=warn` (noise-trimmed `info`),
   baked into dig-logging.
-- **Precedence (first non-empty wins):** `persisted` (a level the operator saved via `logs level`) >
-  **`DIG_LOG`** (the ecosystem-common env name) > **`RUST_LOG`** (the Rust convention, kept working) >
-  the default directive.
+- **Precedence (first VALID non-empty wins):** `persisted` (a level the operator saved via
+  `logs level`) > **`DIG_LOG`** (the ecosystem-common env name) > **`RUST_LOG`** (the Rust
+  convention, kept working) > the default directive.
+- **Every candidate directive is VALIDATED against `EnvFilter` before it is chosen.** A directive
+  that does not parse is SKIPPED and resolution falls through to the next source — ultimately the
+  always-valid default. Logging is NEVER disabled because a bad directive was persisted (a persisted
+  `level` file survives restarts, so an un-validated garbage directive would otherwise make `init`
+  fail on every subsequent start). `logs level` additionally REJECTS an invalid directive at write
+  time, so garbage is not persisted in the first place; the read-time validation is the backstop for
+  anything persisted before that guard existed.
 - One `EnvFilter` is shared by both sinks in v1.
 - **Runtime reload.** `init()` returns a guard exposing `set_filter(&str)`; it swaps the live filter
   via a `tracing_subscriber::reload` handle. Consumers with a control plane (dig-node's
@@ -191,10 +198,16 @@ The rule set is versioned (`redaction_rules_version`, recorded in the bundle man
   - **Bare prose key phrases** — `<kind> key <hex-or-base64>` for `kind` ∈
     `signing|private|secret|beacon|identity|node|master|ed25519|bls|api` (e.g. `loaded identity key
     <hex>`, `node key <hex>`), which no kv rule would catch.
-  - **Positional / Debug-struct shapes** — a known secret TYPE name immediately wrapping a value with
-    no `:`/`=` separator: `PrivKey(…)`, `SecretKey(…)`, `SigningKey(…)`, `SecretString(…)`, `Seed([…])`,
-    `Mnemonic("…")`, `KeyPair(…)`, `Xprv(…)`, `MasterKey(…)`, `Ed25519SecretKey(…)`, `BlsSecretKey(…)`.
-    Keyed on the type name so benign wrappers (`Coin(…)`, `Peer(…)`) are left alone.
+  - **Positional / Debug-struct shapes** — a secret TYPE name immediately wrapping a value with no
+    `:`/`=` separator: `PrivKey(…)`, `SecretKey(…)`, `SigningKey(…)`, `SecretString(…)`, `Seed([…])`,
+    `Mnemonic("…")`, `KeyPair(…)`, `Xprv(…)`, `MasterKey(…)`, and prefixed/aliased forms such as
+    `ExtendedPrivKey(…)`, `MasterSecret(…)`, `BlsSk(…)`, `Ed25519Sk(…)`. Detection is SUFFIX-driven —
+    a CamelCase type name that ENDS in a secret marker (`*PrivKey`/`*SecretKey`/`*Secret`/`*Seed`/
+    `*Sk`/…), so a leading qualifier is absorbed. The `Sk` abbreviation is matched CASE-SENSITIVELY so
+    benign words ending in lowercase `sk` (`Task(…)`, `Disk(…)`) and unrelated wrappers (`Coin(…)`,
+    `Peer(…)`) are left alone. **This TYPE list is explicitly NON-EXHAUSTIVE**: a novel secret type
+    name can still slip through, so source-discipline (§7 — never log a secret in the first place)
+    remains the PRIMARY defense; this rule is defense-in-depth for the common Debug shapes.
   - **PEM blocks** — `-----BEGIN … -----` … `-----END … -----`, including blocks split across lines.
   - **`Authorization` / bearer values** — `Authorization: <v>`, `Bearer <v>`.
   - **Control / pairing / API / session token values** — `token`/`api_key`/`apikey`/`secret`/
@@ -229,7 +242,8 @@ pub fn init(service: Service) -> Result<LogGuard, Error>;           // real env 
 impl LogGuard { pub fn set_filter(&self, directive: &str) -> Result<(), Error>; }
 
 pub fn resolve_log_dir(service, get_env, can_create) -> PathBuf;    // pure, table-testable
-pub fn resolve_filter(persisted, dig_log, rust_log, default) -> String; // pure precedence (§5)
+pub fn resolve_filter(persisted, dig_log, rust_log) -> String;      // pure precedence (§5)
+pub fn resolve_valid_filter(persisted, dig_log, rust_log) -> String; // precedence + EnvFilter validity (§5)
 
 pub mod redact { pub fn line(input: &str) -> String; pub const RULES_VERSION: u32; }
 pub mod logs { pub fn command() -> clap::Command; pub fn run(service, matches) -> Result<()>; }
