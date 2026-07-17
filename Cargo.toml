@@ -1,0 +1,49 @@
+[package]
+name = "dig-logging"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Shared structured logging + log-collection building block for the DIG service binaries (dig-node, dig-dns, dig-updater): dual JSONL-file + human-stderr sinks, a per-OS log-dir convention, daily rotation + a byte-cap janitor, run_id/op_id correlation, a versioned redaction engine, and a reusable `logs` CLI verb set."
+license = "GPL-2.0-only"
+repository = "https://github.com/DIG-Network/dig-logging"
+readme = "README.md"
+keywords = ["logging", "tracing", "jsonl", "observability", "dig"]
+categories = ["development-tools::debugging"]
+
+[dependencies]
+# The event/span facade every DIG binary already emits to — dig-logging composes subscribers over it.
+tracing = "0.1"
+# The subscriber toolkit: EnvFilter (level control), reload (runtime level swap), the registry span
+# store the JSON layer reads span fields from, and the compact `fmt` human console layer.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "env-filter", "registry", "ansi"] }
+# Rolling-daily file appender + the non-blocking (lossy) writer that keeps a saturated log pipeline
+# from stalling a service's serve path.
+tracing-appender = "0.2"
+# The JSONL record model + manifest (de)serialization.
+serde = { version = "1", features = ["derive"] }
+# `preserve_order` keeps record fields in the SPEC §2 insertion order so lines read top-to-bottom.
+serde_json = { version = "1", features = ["preserve_order"] }
+# run_id (UUIDv4 minted once per process run).
+uuid = { version = "1", features = ["v4"] }
+# RFC 3339 UTC timestamps for `ts` and the byte-cap janitor's mtime ordering. `time` (not chrono) to
+# stay aligned with tracing-appender's own time stack.
+time = { version = "0.3", features = ["formatting", "macros"] }
+# Structured errors for the public API.
+thiserror = "2"
+# The reusable `logs` clap subcommand.
+clap = { version = "4", features = ["derive"] }
+# Redaction rules (mnemonic/PEM/token detection) — compiled once via a lazy static.
+regex = "1"
+once_cell = "1"
+# The authoritative English BIP39 wordlist for the mnemonic-run detector — reused, never hand-rolled.
+bip39 = { version = "2", default-features = false }
+# `logs bundle` zip writer.
+zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+
+[dev-dependencies]
+# Hermetic temp dirs for dir-resolution, rotation, janitor, and bundle tests.
+tempfile = "3"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
