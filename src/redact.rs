@@ -28,7 +28,7 @@ use regex::Regex;
 ///
 /// v2 added field-name-driven private-key/seed redaction ([`SENSITIVE_KV`], [`KEY_PHRASE`]) and
 /// numbered-mnemonic detection, over v1's PEM + token/auth + narrow mnemonic set.
-pub const RULES_VERSION: u32 = 2;
+pub const RULES_VERSION: u32 = 3;
 
 /// The minimum consecutive BIP39 words that constitute a redactable mnemonic run (SPEC §8.2).
 const MIN_MNEMONIC_RUN: usize = 12;
@@ -55,8 +55,11 @@ static PEM_BLOCK: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?s)-----BEGIN[^-]*-----.*?-----END[^-]*-----").unwrap());
 
 /// `Authorization: <v>` / `"authorization":"<v>"` — keep the key, redact the value.
-static AUTH_HEADER: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"(?i)(authorization"?\s*[:=]\s*"?)([^"\s,}]+)"#).unwrap());
+/// Handles both `Authorization: Bearer <token>` and bare `Authorization: <opaque>` forms,
+/// consuming the Bearer scheme + token together so the full credential is redacted.
+static AUTH_HEADER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(authorization"?\s*[:=]\s*"?)((?:[Bb]earer\s+)?[A-Za-z0-9._\-]+)"#).unwrap()
+});
 
 /// `Bearer <token>` anywhere.
 static BEARER: Lazy<Regex> =
@@ -270,12 +273,53 @@ mod tests {
 
     #[test]
     fn redacts_pem_and_tokens() {
+        // PEM block redaction
+        let pem_out = line("key: -----BEGIN PRIVATE KEY-----\\nMIIB\\n-----END PRIVATE KEY-----");
+        assert!(pem_out.contains("[REDACTED:pem]"), "pem: {pem_out}");
+        assert!(!pem_out.contains("BEGIN"), "pem key leaked: {pem_out}");
+        assert!(!pem_out.contains("MIIB"), "pem key leaked: {pem_out}");
+
+        // JSON token field redaction
+        let token_out = line(r#"{"token":"abc123secret"}"#);
+        assert!(token_out.contains("[REDACTED:token]"), "token: {token_out}");
         assert!(
-            line("key: -----BEGIN PRIVATE KEY-----\\nMIIB\\n-----END PRIVATE KEY-----")
-                .contains("[REDACTED:pem]")
+            !token_out.contains("abc123secret"),
+            "token leaked: {token_out}"
         );
-        assert!(line(r#"{"token":"abc123secret"}"#).contains("[REDACTED:token]"));
-        assert!(line("Authorization: Bearer zzz.yyy.xxx").contains("[REDACTED:auth]"));
+
+        // Authorization header with Bearer token (the main security leak case)
+        let auth_out = line("Authorization: Bearer zzz.yyy.xxx");
+        assert!(auth_out.contains("[REDACTED:auth]"), "auth: {auth_out}");
+        assert!(
+            !auth_out.contains("zzz.yyy.xxx"),
+            "Bearer token leaked: {auth_out}"
+        );
+        assert!(
+            !auth_out.contains("Bearer zzz"),
+            "Bearer token leaked: {auth_out}"
+        );
+
+        // Bare Authorization header (non-Bearer form)
+        let opaque_out = line("Authorization: opaque_token_abc123");
+        assert!(
+            opaque_out.contains("[REDACTED:auth]"),
+            "opaque: {opaque_out}"
+        );
+        assert!(
+            !opaque_out.contains("opaque_token_abc123"),
+            "opaque token leaked: {opaque_out}"
+        );
+
+        // Standalone Bearer without Authorization prefix
+        let bearer_out = line("Bearer eyJ.payload.sig");
+        assert!(
+            bearer_out.contains("[REDACTED:auth]"),
+            "bearer: {bearer_out}"
+        );
+        assert!(
+            !bearer_out.contains("eyJ.payload.sig"),
+            "Bearer credential leaked: {bearer_out}"
+        );
     }
 
     #[test]
