@@ -29,7 +29,12 @@ use regex::Regex;
 /// v2 added field-name-driven private-key/seed redaction ([`SENSITIVE_KV`], [`KEY_PHRASE`]) and
 /// numbered-mnemonic detection, over v1's PEM + token/auth + narrow mnemonic set.
 /// v3 → v4: fixed AUTH_HEADER and BEARER to redact full standard-base64 credentials (including +/= chars).
-pub const RULES_VERSION: u32 = 4;
+/// v4 → v5 (defense-in-depth residuals): the generic `key`/`keystore` names are now scrubbed when
+/// their VALUE looks like raw secret material ([`CONDITIONAL_SENSITIVE`]); [`KEY_PHRASE`] covers
+/// `identity|node|master|ed25519|bls|api` prose forms; positional Debug shapes with no separator
+/// (`PrivKey(…)`/`Seed([…])`/`Mnemonic("…")`) are caught by [`SECRET_DEBUG_TUPLE`]; and the `priv`
+/// substring rule is tightened to private-key markers so `privacy`/`private-beta` are not over-scrubbed.
+pub const RULES_VERSION: u32 = 5;
 
 /// The minimum consecutive BIP39 words that constitute a redactable mnemonic run (SPEC §8.2).
 const MIN_MNEMONIC_RUN: usize = 12;
@@ -134,15 +139,49 @@ static SENSITIVE_KV: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?i)("?)([A-Za-z][A-Za-z0-9_]*)("?\s*[:=]\s*"?)([^"\s,}]+)"#).unwrap()
 });
 
-/// A bare prose reference `<kind> key <hex-or-base64>` (e.g. `loaded signing key <hex>`), which no
-/// kv rule would catch. Group 1 = the `<kind> key` phrase (kept), group 2 = the secret material.
+/// A bare prose reference `<kind> key <hex-or-base64>` (e.g. `loaded signing key <hex>`, `node key
+/// <hex>`), which no kv rule would catch. The `<kind>` alternation covers every phrase a DIG service
+/// uses to log a key inline. Group 1 = the `<kind> key` phrase (kept), group 2 = the secret material.
 static KEY_PHRASE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b((?:signing|private|secret|beacon)\s+key)\s+([A-Za-z0-9+/]{16,}={0,2})")
-        .unwrap()
+    Regex::new(
+        r"(?i)\b((?:signing|private|secret|beacon|identity|node|master|ed25519|bls|api)\s+key)\s+([A-Za-z0-9+/]{16,}={0,2})",
+    )
+    .unwrap()
+});
+
+/// Names too GENERIC to blanket-scrub (a `key=user_id` map-debug line is not a secret), redacted
+/// ONLY when the VALUE itself looks like raw secret material ([`value_looks_secret`]). This closes the
+/// bare-`key`/`keystore` residual (neither ends `_key`, so [`is_sensitive_key`] misses both) without
+/// false-scrubbing short, obviously-non-secret values.
+const CONDITIONAL_SENSITIVE: &[&str] = &["key", "keystore"];
+
+/// A VALUE that looks like raw secret key material: a long hex string or a base64/base64url blob
+/// (≥ 20 chars, standard-base64 alphabet incl. `+`/`/` and optional `=` padding). Hex is a subset of
+/// this alphabet, so this single shape covers 32-hex-char keys and base64-encoded keys alike. Used to
+/// gate [`CONDITIONAL_SENSITIVE`] names; mnemonic runs are already redacted upstream.
+static VALUE_SECRET_SHAPE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^[A-Za-z0-9+/]{20,}={0,2}$").unwrap());
+
+fn value_looks_secret(value: &str) -> bool {
+    VALUE_SECRET_SHAPE.is_match(value)
+}
+
+/// Positional / Debug-struct shapes that carry secret material with NO `:`/`=` separator — e.g.
+/// `PrivKey(0xabc…)`, `Seed([1, 2, 3])`, `Mnemonic("abandon …")` — matched by no kv rule. Keyed on
+/// KNOWN secret TYPE names (case-insensitive) so benign wrappers like `Coin(…)`/`Peer(…)` are left
+/// alone. Group 1 = the type name (kept), 2 = the opening bracket, 3 = the closing bracket; the
+/// enclosed material is replaced. `[^)\]]*` keeps the match within a single bracket pair.
+static SECRET_DEBUG_TUPLE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)\b(priv(?:ate)?key|secretkey|signingkey|secretstring|seed|mnemonic|keypair|xprv|masterkey|ed25519secretkey|blssecretkey)\s*([(\[])[^)\]]*([)\]])",
+    )
+    .unwrap()
 });
 
 /// Is a field NAME one whose value must be redacted? Safe public ids ([`SAFE_KEY_NAMES`]) win first;
-/// then exact sensitive names, the `_key`/`_secret` suffix, and `seed`/`mnemonic`/`priv` substrings.
+/// then exact sensitive names, the `_key`/`_secret` suffix, `seed`/`mnemonic` substrings, and the
+/// private-key markers ([`marks_private_key`]). Deliberately does NOT contain a bare `priv` substring
+/// check — that over-scrubbed `privacy`/`private-beta`; the private-key markers are matched precisely.
 fn is_sensitive_key(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     if SAFE_KEY_NAMES.contains(name.as_str()) {
@@ -153,7 +192,18 @@ fn is_sensitive_key(name: &str) -> bool {
         || name.ends_with("_secret")
         || name.contains("seed")
         || name.contains("mnemonic")
-        || name.contains("priv")
+        || marks_private_key(&name)
+}
+
+/// Does a field name mark a PRIVATE key precisely (not the incidental `priv` substring of `privacy`
+/// or `private-beta`)? Matches `priv`, a `priv_` prefix, and the `privkey`/`privatekey`/`xpriv`
+/// spellings — the private-key names that lack a `_key`/`_secret` suffix.
+fn marks_private_key(name: &str) -> bool {
+    name == "priv"
+        || name.starts_with("priv_")
+        || name.contains("privkey")
+        || name.contains("privatekey")
+        || name.contains("xpriv")
 }
 
 /// A bech32 `xch1…`/`txch1…` address — truncate to the HRP + first 8 payload chars.
@@ -182,13 +232,22 @@ pub fn line(input: &str) -> String {
     let stage = KEY_PHRASE
         .replace_all(&stage, "${1} [REDACTED:key]")
         .into_owned();
-    // Field-name-driven key redaction: redact a value ONLY when its NAME is secret, and never
-    // re-touch an already-redacted value (so a prior token/auth rule keeps its `:token`/`:auth` kind).
+    // Positional Debug shapes (`PrivKey(…)`/`Seed([…])`) carrying secret material with no separator.
+    let stage = SECRET_DEBUG_TUPLE
+        .replace_all(&stage, "${1}${2}[REDACTED:key]${3}")
+        .into_owned();
+    // Field-name-driven key redaction: redact a value when its NAME is secret, OR when a GENERIC
+    // name (`key`/`keystore`) has a secret-SHAPED value; never re-touch an already-redacted value (so
+    // a prior token/auth rule keeps its `:token`/`:auth` kind).
     let stage = SENSITIVE_KV
         .replace_all(&stage, |caps: &regex::Captures| {
+            let name = &caps[2];
             let value = &caps[4];
-            if is_sensitive_key(&caps[2]) && !value.starts_with("[REDACTED") {
-                format!("{}{}{}[REDACTED:key]", &caps[1], &caps[2], &caps[3])
+            let sensitive = is_sensitive_key(name)
+                || (CONDITIONAL_SENSITIVE.contains(&name.to_ascii_lowercase().as_str())
+                    && value_looks_secret(value));
+            if sensitive && !value.starts_with("[REDACTED") {
+                format!("{}{}{}[REDACTED:key]", &caps[1], name, &caps[3])
             } else {
                 caps[0].to_string()
             }
@@ -504,5 +563,131 @@ mod tests {
             !got.contains("+def/ghi=="),
             "Standalone Bearer tail (+/= chars) leaked: {got}"
         );
+    }
+
+    // --- v5: defense-in-depth residuals (#714). Each asserts the SECRET VALUE is ABSENT. ---
+
+    /// GAP 1: the generic `key`/`keystore` field names — missed by the `_key` suffix rule — leak a
+    /// secret-shaped value. Now scrubbed (in kv AND JSON, for both names) when the VALUE looks secret.
+    #[test]
+    fn gap1_redacts_bare_key_and_keystore_with_secret_value() {
+        let secret = "ZcjI14QiJ1Qety2clrKoDEkJyehiSBRoiYylEfiW3JI";
+        for name in ["key", "keystore", "KEY", "Keystore"] {
+            let kv = line(&format!("{name}={secret}"));
+            assert!(!kv.contains(secret), "kv {name} leaked the secret: {kv}");
+            assert!(kv.contains("[REDACTED:key]"), "kv {name}: {kv}");
+
+            let json = line(&format!(r#"{{"{name}":"{secret}"}}"#));
+            assert!(
+                !json.contains(secret),
+                "json {name} leaked the secret: {json}"
+            );
+            assert!(json.contains("[REDACTED:key]"), "json {name}: {json}");
+        }
+    }
+
+    /// GAP 1 (over-scrub guard): a bare `key` with a short, obviously-non-secret value (a map-key
+    /// debug line) is KEPT — the value shape gates the scrub, so `key=user_id` survives.
+    #[test]
+    fn gap1_keeps_bare_key_with_nonsecret_short_value() {
+        for benign in ["key=user_id", "key=42", "keystore=default", "key=name"] {
+            let got = line(benign);
+            assert!(
+                !got.contains("[REDACTED"),
+                "benign `{benign}` over-scrubbed: {got}"
+            );
+        }
+    }
+
+    /// GAP 2: prose `<kind> key <hex>` for the extended kinds (`identity`/`node`/`master`/`ed25519`/
+    /// `bls`/`api`) leaked before — no kv separator, and KEY_PHRASE didn't list these kinds.
+    #[test]
+    fn gap2_redacts_extended_key_phrases() {
+        for kind in ["identity", "node", "master", "ed25519", "bls", "api"] {
+            let secret = "5f3a9c1b7e2d4088aa11bb22cc33dd44";
+            let got = line(&format!("loaded {kind} key {secret}"));
+            assert!(!got.contains(secret), "{kind} key leaked: {got}");
+            assert!(
+                got.contains(&format!("{kind} key [REDACTED:key]")),
+                "{kind}: {got}"
+            );
+        }
+    }
+
+    /// GAP 3: positional / Debug-tuple shapes with NO `:`/`=` separator leaked before — no rule
+    /// matched `PrivKey(0x…)`, `Seed([…])`, `Mnemonic("…")`. Now caught by the type-name detector.
+    #[test]
+    fn gap3_redacts_positional_secret_debug_shapes() {
+        let cases = [
+            (
+                "PrivKey(0xabc123def456abc123def456abc1)",
+                "abc123def456abc123def456abc1",
+            ),
+            ("Seed([222, 173, 190, 239, 1, 2, 3, 4])", "222, 173, 190"),
+            (
+                r#"Mnemonic("abandon ability able about")"#,
+                "abandon ability",
+            ),
+            (
+                "SigningKey(deadbeefdeadbeefdeadbeef)",
+                "deadbeefdeadbeefdeadbeef",
+            ),
+            ("Xprv(xprv9sdeadbeefcafe0011)", "xprv9sdeadbeefcafe0011"),
+        ];
+        for (input, secret) in cases {
+            let got = line(input);
+            assert!(!got.contains(secret), "positional secret leaked: {got}");
+            assert!(got.contains("[REDACTED:key]"), "not redacted: {got}");
+        }
+        // A benign wrapper of the SAME shape must NOT be scrubbed (keyed on secret type names only).
+        let benign = line("Coin([222, 173]) Peer(203.0.113.7)");
+        assert!(
+            !benign.contains("[REDACTED"),
+            "benign wrapper over-scrubbed: {benign}"
+        );
+    }
+
+    /// GAP 4: names that merely CONTAIN `priv` but are not private keys (`privacy`, `private-beta`)
+    /// were over-scrubbed by the old bare-substring rule. They are now KEPT.
+    #[test]
+    fn gap4_keeps_privacy_and_private_beta_field_names() {
+        for kept in ["privacy=enabled", "private_beta=true", "privatebeta=on"] {
+            let got = line(kept);
+            assert!(!got.contains("[REDACTED"), "`{kept}` over-scrubbed: {got}");
+        }
+        // ...but genuine private-key markers WITHOUT a `_key` suffix are still caught.
+        let secret = "ZcjI14QiJ1Qety2clrKoDEkJyehiSBRoiYylEfiW3JI";
+        for name in ["priv", "privkey", "xpriv"] {
+            let got = line(&format!("{name}={secret}"));
+            assert!(!got.contains(secret), "{name} leaked: {got}");
+            assert!(got.contains("[REDACTED:key]"), "{name}: {got}");
+        }
+    }
+
+    /// KEEP guard (residuals edition): the SAFE_KEY_NAMES allowlist must survive the v5 changes —
+    /// `storeId`, `rootHash`, `coinId`, `public_key`, and `resource_key` values are NEVER scrubbed.
+    #[test]
+    fn keeps_safe_named_public_ids_after_v5() {
+        let secret_shaped = "cafebabecafebabecafebabecafebabecafebabe"; // looks high-entropy, but public
+        for name in [
+            "storeId",
+            "store_id",
+            "rootHash",
+            "root_hash",
+            "coinId",
+            "coin_id",
+            "public_key",
+            "resource_key",
+        ] {
+            let got = line(&format!("{name}={secret_shaped}"));
+            assert!(
+                !got.contains("[REDACTED"),
+                "safe id `{name}` over-scrubbed: {got}"
+            );
+            assert!(
+                got.contains(secret_shaped),
+                "safe id `{name}` value dropped: {got}"
+            );
+        }
     }
 }
