@@ -28,7 +28,7 @@ use regex::Regex;
 ///
 /// v2 added field-name-driven private-key/seed redaction ([`SENSITIVE_KV`], [`KEY_PHRASE`]) and
 /// numbered-mnemonic detection, over v1's PEM + token/auth + narrow mnemonic set.
-/// v3 → v4: fixed AUTH_HEADER to redact full standard-base64 credentials (including +/= chars).
+/// v3 → v4: fixed AUTH_HEADER and BEARER to redact full standard-base64 credentials (including +/= chars).
 pub const RULES_VERSION: u32 = 4;
 
 /// The minimum consecutive BIP39 words that constitute a redactable mnemonic run (SPEC §8.2).
@@ -64,9 +64,8 @@ static AUTH_HEADER: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?i)(authorization"?\s*[:=]\s*"?)((?:[A-Za-z]+\s+)?[^"\s,}]+)"#).unwrap()
 });
 
-/// `Bearer <token>` anywhere.
-static BEARER: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\bbearer\s+([A-Za-z0-9._\-]+)").unwrap());
+/// `Bearer <token>` anywhere - widen to capture full standard-base64 tokens (+ / =).
+static BEARER: Lazy<Regex> = Lazy::new(|| Regex::new(r#"(?i)\bbearer\s+([^"\s,}]+)"#).unwrap());
 
 /// `token`/`api_key`/`secret`/`password`/`passphrase`/`pairing_code` = / : `<v>` (JSON or kv).
 static TOKEN_KV: Lazy<Regex> = Lazy::new(|| {
@@ -485,5 +484,25 @@ mod tests {
             "Bare auth credential leaked: {got}"
         );
         assert!(!got.contains("+w=="), "Bare auth tail leaked: {got}");
+    }
+    /// REGRESSION TEST: Standalone Bearer tokens (outside Authorization header) with standard
+    /// base64 must be fully redacted, including +/= chars.
+    #[test]
+    fn redacts_standalone_bearer_with_standard_base64() {
+        // Standalone Bearer without Authorization: prefix
+        let standalone_bearer = "Bearer abc+def/ghi==";
+        let got = line(standalone_bearer);
+        assert!(
+            got.contains("[REDACTED:auth]"),
+            "Standalone Bearer not redacted: {got}"
+        );
+        assert!(
+            !got.contains("abc+def/ghi=="),
+            "Standalone Bearer credential leaked: {got}"
+        );
+        assert!(
+            !got.contains("+def/ghi=="),
+            "Standalone Bearer tail (+/= chars) leaked: {got}"
+        );
     }
 }
