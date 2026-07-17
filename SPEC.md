@@ -180,9 +180,21 @@ The rule set is versioned (`redaction_rules_version`, recorded in the bundle man
     value redacted, in `key=value`, `key: value`, or JSON `"key":"value"` form, covering raw
     base64/hex values (the DIG identity signing key, the beacon Ed25519 key): `private_key`,
     `secret_key`, `signing_key`, `beacon_key`, `sk`, `xprv`, `wif`, `seed`, `mnemonic`, and generally
-    any name ending `_key`/`_secret` or containing `seed`/`mnemonic`/`priv`. Also the bare prose form
-    `<signing|private|secret|beacon> key <hex-or-base64>`. Redaction is FIELD-NAME-driven, NOT a
-    blanket entropy heuristic — see KEEP below.
+    any name ending `_key`/`_secret` or containing `seed`/`mnemonic`. Private-key markers WITHOUT a
+    `_key` suffix are matched precisely (`priv`, a `priv_` prefix, `privkey`/`privatekey`/`xpriv`), so
+    incidental `priv` substrings (`privacy`, `private-beta`) are NOT over-scrubbed. Redaction is
+    FIELD-NAME-driven, NOT a blanket entropy heuristic — see KEEP below.
+  - **Generic `key`/`keystore` FIELDS (value-shape-gated)** — the bare names `key` and `keystore`
+    are too generic to blanket-scrub (a `key=user_id` map-debug line is not a secret), so their value
+    is redacted ONLY when it looks like raw secret material (a ≥ 20-char hex or base64/base64url blob).
+    Short/obviously-non-secret values (`key=user_id`, `keystore=default`) are KEPT.
+  - **Bare prose key phrases** — `<kind> key <hex-or-base64>` for `kind` ∈
+    `signing|private|secret|beacon|identity|node|master|ed25519|bls|api` (e.g. `loaded identity key
+    <hex>`, `node key <hex>`), which no kv rule would catch.
+  - **Positional / Debug-struct shapes** — a known secret TYPE name immediately wrapping a value with
+    no `:`/`=` separator: `PrivKey(…)`, `SecretKey(…)`, `SigningKey(…)`, `SecretString(…)`, `Seed([…])`,
+    `Mnemonic("…")`, `KeyPair(…)`, `Xprv(…)`, `MasterKey(…)`, `Ed25519SecretKey(…)`, `BlsSecretKey(…)`.
+    Keyed on the type name so benign wrappers (`Coin(…)`, `Peer(…)`) are left alone.
   - **PEM blocks** — `-----BEGIN … -----` … `-----END … -----`, including blocks split across lines.
   - **`Authorization` / bearer values** — `Authorization: <v>`, `Bearer <v>`.
   - **Control / pairing / API / session token values** — `token`/`api_key`/`apikey`/`secret`/
