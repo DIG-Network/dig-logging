@@ -19,13 +19,14 @@ const SEED12: &str =
 fn seed_logs(root: &std::path::Path) {
     let dir = root.join("dig-node");
     fs::create_dir_all(&dir).unwrap();
+    let error_line = format!(
+        r#"{{"schema":1,"ts":"2026-07-16T00:00:03Z","level":"ERROR","target":"c","message":"seed {SEED12}","store":"abc123"}}"#
+    );
     let lines = format!(
         "{}\n{}\n{}\n",
         r#"{"schema":1,"ts":"2026-07-16T00:00:01Z","level":"INFO","target":"a","message":"boot","run_id":"r"}"#,
         r#"{"schema":1,"ts":"2026-07-16T00:00:02Z","level":"WARN","target":"b","message":"slow"}"#,
-        format!(
-            r#"{{"schema":1,"ts":"2026-07-16T00:00:03Z","level":"ERROR","target":"c","message":"seed {SEED12}","store":"abc123"}}"#
-        ),
+        error_line,
     );
     fs::write(dir.join("dig-node.jsonl.2026-07-16"), lines).unwrap();
 }
