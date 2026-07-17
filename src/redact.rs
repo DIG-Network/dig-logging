@@ -139,12 +139,13 @@ static SENSITIVE_KV: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?i)("?)([A-Za-z][A-Za-z0-9_]*)("?\s*[:=]\s*"?)([^"\s,}]+)"#).unwrap()
 });
 
-/// A bare prose reference `<kind> key <hex-or-base64>` (e.g. `loaded signing key <hex>`, `node key
+/// A bare prose reference `<kind> key <hex-or-base64url>` (e.g. `loaded signing key <hex>`, `node key
 /// <hex>`), which no kv rule would catch. The `<kind>` alternation covers every phrase a DIG service
-/// uses to log a key inline. Group 1 = the `<kind> key` phrase (kept), group 2 = the secret material.
+/// uses to log a key inline. Group 1 = the `<kind> key` phrase (kept), group 2 = the secret material
+/// (standard base64 + base64url alphabet).
 static KEY_PHRASE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r"(?i)\b((?:signing|private|secret|beacon|identity|node|master|ed25519|bls|api)\s+key)\s+([A-Za-z0-9+/]{16,}={0,2})",
+        r"(?i)\b((?:signing|private|secret|beacon|identity|node|master|ed25519|bls|api)\s+key)\s+([A-Za-z0-9+/_-]{16,}={0,2})",
     )
     .unwrap()
 });
@@ -631,6 +632,30 @@ mod tests {
                 "{kind}: {got}"
             );
         }
+    }
+
+    /// REGRESSION TEST (issue #714): bare key phrase `<kind> key <base64url>` with - and _
+    /// characters must be fully redacted (no tail leak). The prior KEY_PHRASE regex only matched
+    /// standard base64, leaking the tail after the first - or _ character.
+    #[test]
+    fn gap2_redacts_base64url_key_phrase_full_tail() {
+        // A 44-char base64url-encoded secret containing both - and _
+        let secret = "ABCDEFGHIJKLMNOPqrstuvwx-yz012345_6789ABCD";
+        let tail_after_dash = "yz012345_6789ABCD";
+
+        let got = line(&format!("loaded identity key {secret}"));
+        assert!(
+            !got.contains(secret),
+            "identity key base64url secret leaked: {got}"
+        );
+        assert!(
+            !got.contains(tail_after_dash),
+            "identity key tail-leak (after dash): {got}"
+        );
+        assert!(
+            got.contains("identity key [REDACTED:key]"),
+            "identity key not redacted: {got}"
+        );
     }
 
     /// GAP 3: positional / Debug-tuple shapes with NO `:`/`=` separator leaked before — no rule
