@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.1.4] - 2026-07-17
+
+### Bug Fixes
+- **redact:** Catch named-field brace secret-Debug shapes (#730) (#5)
+
 ## [0.1.3] - 2026-07-17
 
 ### Bug Fixes
