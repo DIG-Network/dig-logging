@@ -26,6 +26,10 @@
 //! filter, and stamps a per-run `run_id` (+ `op_id`/`parent_op_id` correlation). Hold the returned
 //! [`LogGuard`] for the process lifetime.
 //!
+//! If the log directory cannot be opened, `init` does NOT fail — it installs the `stderr` sink
+//! alone, warns there naming the path, and reports the condition via [`LogGuard::file_error`], so a
+//! filesystem problem never leaves a binary with no logging at all.
+//!
 //! ## Collection
 //!
 //! Consumers mount the reusable [`logs`] verbs (`path`/`tail`/`level`/`bundle`) and the [`redact`]

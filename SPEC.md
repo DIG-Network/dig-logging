@@ -22,6 +22,13 @@ from an illustrative sketch elsewhere, this document wins.
 2. **Console sink — compact human text on `stderr`.** Preserves each binary's existing
    operator/journald experience; on Linux `journalctl -u <svc>` captures it for free.
 
+**The console sink is unconditional.** When the file sink cannot be opened — an unwritable or
+unusable log directory, e.g. a service-account-owned directory entered by an interactive run — `init()`
+MUST still install the console sink, MUST write one warning to it naming the failing path and the
+reason, and MUST report the condition through `LogGuard::file_error()`. It MUST NOT fail. Logging is
+never disabled by a file-system failure: a process with no subscriber makes a broken subsystem
+indistinguishable from a dead one.
+
 No Windows Event Log / ETW, syslog, or OpenTelemetry sink exists in v1. The schema is additive-only,
 so such sinks MAY be added later without breaking consumers.
 
@@ -256,7 +263,11 @@ A `logs bundle` zip contains, at the archive root:
 pub struct Service { pub name: &'static str, pub version: &'static str, pub run_context: RunContext }
 pub enum RunContext { Service, Cli }
 pub fn init(service: Service) -> Result<LogGuard, Error>;           // real env + filesystem
-impl LogGuard { pub fn set_filter(&self, directive: &str) -> Result<(), Error>; }
+impl LogGuard {
+    pub fn log_dir(&self) -> &Path;
+    pub fn file_error(&self) -> Option<&str>;                       // Some => console-only (§1)
+    pub fn set_filter(&self, directive: &str) -> Result<(), Error>;
+}
 
 pub fn resolve_log_dir(service, get_env, can_create) -> PathBuf;    // pure, table-testable
 pub fn resolve_filter(persisted, dig_log, rust_log) -> String;      // pure precedence (§5)
