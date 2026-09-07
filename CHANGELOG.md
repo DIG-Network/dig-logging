@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.2.2] - 2026-09-07
+
+### Bug Fixes
+- **dirs:** Probe the log dir for writability, not existence (#9)
+
 ## [0.2.1] - 2026-09-04
 
 ### Documentation
