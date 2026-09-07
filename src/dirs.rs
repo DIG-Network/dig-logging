@@ -10,8 +10,9 @@
 //!    `cargo run`), mirroring dig-node's #501 dev-fallback pattern.
 //!
 //! The CLI and the service resolve identically, so `<bin> logs path` names the directory the service
-//! writes to. Resolution is a PURE function of an injected env-getter + a "can this dir be created?"
-//! probe, so every branch is table-testable without touching the real filesystem or environment.
+//! writes to. Resolution is a PURE function of an injected env-getter + a "can this dir be created
+//! and written?" probe, so every branch is table-testable without touching the real filesystem or
+//! environment.
 //!
 //! **Operator read on Windows (#728).** The machine root lives under `%ProgramData%\DigNetwork`,
 //! which dig-installer #715 locks to a protected, non-inheriting DACL of `{SYSTEM:F, Administrators:F}`
@@ -113,7 +114,7 @@ pub fn log_dir(service: &str) -> PathBuf {
     #[cfg(windows)]
     if resolved.source == LogDirSource::MachineRoot {
         // Best-effort: a failed grant must never stop the service from logging. The dir already
-        // exists (the creatable-probe made it); we only relax read for operators.
+        // exists (the writability probe created and wrote it); we only relax read for operators.
         grant_operator_read(&resolved.path);
     }
 
@@ -126,7 +127,19 @@ pub fn log_dir(service: &str) -> PathBuf {
 /// The probe file is opened with `create_new` so it never follows or truncates a pre-existing file or
 /// symlink, and is removed immediately on success, leaving no residue behind in a writable dir.
 fn dir_is_writable(dir: &std::path::Path) -> bool {
-    std::fs::create_dir_all(dir).is_ok()
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    if ok {
+        let _ = std::fs::remove_file(&probe);
+    }
+    ok
 }
 
 /// The `icacls` argv that grants `BUILTIN\Users` a read+execute ACE, inheritable to child files/dirs,
@@ -314,7 +327,11 @@ mod tests {
     #[cfg(windows)]
     fn lock_dir_unwritable(dir: &Path) {
         let out = std::process::Command::new("icacls")
-            .args([dir.to_str().expect("utf8 path"), "/deny", "*S-1-1-0:(WD,AD)"])
+            .args([
+                dir.to_str().expect("utf8 path"),
+                "/deny",
+                "*S-1-1-0:(WD,AD)",
+            ])
             .output()
             .expect("spawn icacls /deny");
         assert!(
@@ -334,11 +351,7 @@ mod tests {
     impl Drop for WindowsAclUnlock {
         fn drop(&mut self) {
             let _ = std::process::Command::new("icacls")
-                .args([
-                    self.0.to_str().unwrap_or_default(),
-                    "/remove:d",
-                    "*S-1-1-0",
-                ])
+                .args([self.0.to_str().unwrap_or_default(), "/remove:d", "*S-1-1-0"])
                 .output();
         }
     }
