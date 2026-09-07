@@ -10,8 +10,9 @@
 //!    `cargo run`), mirroring dig-node's #501 dev-fallback pattern.
 //!
 //! The CLI and the service resolve identically, so `<bin> logs path` names the directory the service
-//! writes to. Resolution is a PURE function of an injected env-getter + a "can this dir be created?"
-//! probe, so every branch is table-testable without touching the real filesystem or environment.
+//! writes to. Resolution is a PURE function of an injected env-getter + a "can this dir be created
+//! and written?" probe, so every branch is table-testable without touching the real filesystem or
+//! environment.
 //!
 //! **Operator read on Windows (#728).** The machine root lives under `%ProgramData%\DigNetwork`,
 //! which dig-installer #715 locks to a protected, non-inheriting DACL of `{SYSTEM:F, Administrators:F}`
@@ -107,20 +108,38 @@ where
 /// creatable-probe into [`resolve_log_dir_detailed`]. When the machine-root branch is taken on Windows,
 /// grants operators (`BUILTIN\Users`) read on the freshly-created dir (#728) — see the module docs.
 pub fn log_dir(service: &str) -> PathBuf {
-    let resolved = resolve_log_dir_detailed(
-        service,
-        |key| std::env::var(key).ok(),
-        |path| std::fs::create_dir_all(path).is_ok(),
-    );
+    let resolved =
+        resolve_log_dir_detailed(service, |key| std::env::var(key).ok(), dir_is_writable);
 
     #[cfg(windows)]
     if resolved.source == LogDirSource::MachineRoot {
         // Best-effort: a failed grant must never stop the service from logging. The dir already
-        // exists (the creatable-probe made it); we only relax read for operators.
+        // exists (the writability probe created and wrote it); we only relax read for operators.
         grant_operator_read(&resolved.path);
     }
 
     resolved.path
+}
+
+/// Does `dir` exist (creating it if needed) AND accept a new file write? `create_dir_all` alone only
+/// proves existence — a directory an earlier privileged run already created can still refuse this
+/// process's writes (#2110: `BUILTIN\Users` held read+execute only on an installer-provisioned dir).
+/// The probe file is opened with `create_new` so it never follows or truncates a pre-existing file or
+/// symlink, and is removed immediately on success, leaving no residue behind in a writable dir.
+fn dir_is_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".write-probe-{}", std::process::id()));
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    if ok {
+        let _ = std::fs::remove_file(&probe);
+    }
+    ok
 }
 
 /// The `icacls` argv that grants `BUILTIN\Users` a read+execute ACE, inheritable to child files/dirs,
@@ -294,5 +313,76 @@ mod tests {
         assert!(args.iter().any(|a| a == "*S-1-5-32-545:(OI)(CI)RX"));
         // Never a DACL-replacing flag — the inherited {SYSTEM,Admins} full-control must survive.
         assert!(!args.iter().any(|a| a == "/inheritance:r" || a == "/reset"));
+    }
+
+    // -- #2110: create_dir_all alone is an EXISTENCE probe, not a writability probe --------------
+
+    #[cfg(unix)]
+    fn lock_dir_unwritable(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+            .expect("chmod fixture dir read-only");
+    }
+
+    #[cfg(windows)]
+    fn lock_dir_unwritable(dir: &Path) {
+        let out = std::process::Command::new("icacls")
+            .args([
+                dir.to_str().expect("utf8 path"),
+                "/deny",
+                "*S-1-1-0:(WD,AD)",
+            ])
+            .output()
+            .expect("spawn icacls /deny");
+        assert!(
+            out.status.success(),
+            "icacls /deny failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Removes the Everyone-deny ACE on drop, so the fixture unlocks the dir BEFORE `TempDir`'s own
+    /// `Drop` tries to remove it — declared after `temp` in the test fn, so it drops first (reverse
+    /// declaration order).
+    #[cfg(windows)]
+    struct WindowsAclUnlock(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for WindowsAclUnlock {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("icacls")
+                .args([self.0.to_str().unwrap_or_default(), "/remove:d", "*S-1-1-0"])
+                .output();
+        }
+    }
+
+    #[test]
+    fn existing_but_unwritable_dir_fails_the_writability_probe() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("locked");
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+
+        lock_dir_unwritable(&dir);
+        #[cfg(windows)]
+        let _unlock = WindowsAclUnlock(dir.clone());
+
+        // Precondition guard (§2.2): a fixture production cannot reach proves nothing. If the lock
+        // didn't bite (privileged account, or icacls unavailable), skip rather than assert-pass.
+        if std::fs::File::create(dir.join("canary")).is_ok() {
+            eprintln!("skipped: cannot build an unwritable dir on this account");
+            return;
+        }
+
+        assert!(!dir_is_writable(&dir));
+    }
+
+    #[test]
+    fn fresh_writable_dir_probe_succeeds_and_leaves_no_residue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("writable");
+
+        assert!(dir_is_writable(&dir));
+        let residue = std::fs::read_dir(&dir).expect("read_dir").count();
+        assert_eq!(residue, 0, "writability probe left a file behind");
     }
 }

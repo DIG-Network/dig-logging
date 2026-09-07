@@ -29,3 +29,9 @@ Durable realizations. Concise facts with context, not a change diary.
 - **Log dir is user-READABLE, unlike the #501 state dirs.** State dirs are owner-only (they hold the
   control token); the log root is SYSTEM-writable but Users-readable, because logs are operator
   diagnostics and secrets are barred at source (SPEC §7) + redacted at bundle (SPEC §8.2).
+
+- **`create_dir_all` proves existence, not writability (#2110).** It returns `Ok(())` for a directory
+  that already exists whatever its ACL, so an installer-provisioned or previously-privileged-run dir
+  reads as "usable" even when this process can't write it. `log_dir`'s probe now creates AND writes
+  (`create_new`) a throwaway file, so an existing-but-locked machine root correctly falls through to
+  the per-user dev fallback instead of degrading logging to console-only.
